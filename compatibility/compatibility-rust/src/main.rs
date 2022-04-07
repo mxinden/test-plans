@@ -1,5 +1,7 @@
 use env_logger::Env;
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use libp2p::futures::StreamExt;
+use libp2p::swarm::{Swarm, SwarmEvent};
+use libp2p::{identity, multiaddr::Protocol, ping, Multiaddr, PeerId};
 
 const LISTENING_PORT: u16 = 1234;
 
@@ -53,33 +55,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
 
-    match seq {
-        1 => {
-            println!("Test instance, listening for incoming connections.");
+    let mut swarm = {
+        let local_key = identity::Keypair::generate_ed25519();
+        let local_peer_id = PeerId::from(local_key.public());
+        println!("Local peer id: {:?}", local_peer_id);
 
-            let listener = TcpListener::bind(("0.0.0.0", LISTENING_PORT))?;
+        Swarm::new(
+            libp2p::development_transport(local_key).await?,
+            ping::Behaviour::new(ping::Config::new().with_keep_alive(true)),
+            local_peer_id,
+        )
+    };
 
-            client.signal("listening".to_string()).await?;
-
-            let mut connections = listener.incoming();
-
-            for _ in 0..(run_params.test_instance_count - 1) {
-                connections.next().expect("Listener not to close.")?;
-                println!("Established inbound TCP connection.");
-            }
-        }
-        _ => {
-            println!("Test instance, connecting to listening instance.");
-
-            client.barrier("listening".to_string(), 1).await?;
-
-            let remote_addr: Ipv4Addr = {
+    let addr: Multiaddr = {
+        Multiaddr::empty()
+            .with(Protocol::Ip4({
                 let mut octets = ip_addr.octets();
                 octets[3] = 1;
                 octets.into()
-            };
-            let _stream = TcpStream::connect((remote_addr, LISTENING_PORT)).unwrap();
-            println!("Established outbound TCP connection.");
+            }))
+            .with(Protocol::Tcp(LISTENING_PORT))
+    };
+
+    match seq {
+        1 => {
+            println!("Test instance, listening for incoming connections.");
+            swarm.listen_on(addr)?;
+            // TODO: Should we wait for the listen events?
+            client.signal("listening".to_string()).await?;
+        }
+        _ => {
+            println!("Test instance, connecting to listening instance.");
+            client.barrier("listening".to_string(), 1).await?;
+            swarm.dial(addr)?;
+        }
+    }
+
+    loop {
+        match swarm.select_next_some().await {
+            SwarmEvent::NewListenAddr { address, .. } => println!("Listening on {:?}", address),
+            SwarmEvent::Behaviour(event) => {
+                println!("Ping event: {:?}", event);
+                break;
+            }
+            _ => {}
         }
     }
 
