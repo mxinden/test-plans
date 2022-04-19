@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+use std::str::FromStr;
+
 use env_logger::Env;
 use libp2p::futures::StreamExt;
 use libp2p::swarm::{Swarm, SwarmEvent};
@@ -10,6 +13,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(Env::default().default_filter_or("debug")).init();
 
     let (client, run_params) = testground::client::Client::new().await?;
+
+    client
+        .signal_and_wait("initialized_global", run_params.test_instance_count)
+        .await?;
 
     client.wait_network_initialized().await?;
 
@@ -67,38 +74,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     };
 
-    let addr: Multiaddr = {
+    let local_addr: Multiaddr = {
         Multiaddr::empty()
-            .with(Protocol::Ip4({
-                let mut octets = ip_addr.octets();
-                octets[3] = 1;
-                octets.into()
-            }))
+            .with(Protocol::Ip4(ip_addr))
             .with(Protocol::Tcp(LISTENING_PORT))
     };
 
-    match seq {
-        1 => {
-            println!("Test instance, listening for incoming connections.");
-            swarm.listen_on(addr)?;
-            // TODO: Should we wait for the listen events?
-            client.signal("listening".to_string()).await?;
-        }
-        _ => {
-            println!("Test instance, connecting to listening instance.");
-            client.barrier("listening".to_string(), 1).await?;
-            swarm.dial(addr)?;
-        }
-    }
+    println!(
+        "Test instance, listening for incoming connections on: {:?}.",
+        local_addr
+    );
+    swarm.listen_on(local_addr.clone())?;
 
     loop {
         match swarm.select_next_some().await {
-            SwarmEvent::NewListenAddr { address, .. } => println!("Listening on {:?}", address),
-            SwarmEvent::Behaviour(event) => {
-                println!("Ping event: {:?}", event);
+            SwarmEvent::NewListenAddr { address, .. } => {
+                assert_eq!(address, local_addr);
                 break;
             }
-            _ => {}
+            _ => unreachable!(),
+        }
+    }
+
+    let mut address_stream = client
+        .subscribe("addresses")
+        .await
+        .take(run_params.test_instance_count as usize)
+        .filter_map(|a| {
+            let remote_addr = Multiaddr::from_str(&a.unwrap()).unwrap();
+            if remote_addr == local_addr {
+                futures::future::ready(None)
+            } else {
+                futures::future::ready(Some(remote_addr))
+            }
+        });
+
+    client.publish("addresses", local_addr.to_string()).await?;
+
+    while let Some(addr) = address_stream.next().await {
+        swarm.dial(addr).unwrap();
+    }
+
+    let mut pinged = HashSet::new();
+
+    loop {
+        match swarm.select_next_some().await {
+            SwarmEvent::Behaviour(ping::PingEvent {
+                peer,
+                result: Ok(ping::PingSuccess::Ping { .. }),
+            }) => {
+                pinged.insert(peer);
+                if pinged.len() == run_params.test_instance_count as usize - 1 {
+                    break;
+                }
+            }
+            e => {
+                println!("Event: {:?}", e)
+            }
         }
     }
 
