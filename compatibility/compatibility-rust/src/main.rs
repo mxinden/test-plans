@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::str::FromStr;
 
 use env_logger::Env;
+use futures::FutureExt;
 use libp2p::futures::StreamExt;
 use libp2p::swarm::{Swarm, SwarmEvent};
 use libp2p::{identity, multiaddr::Protocol, ping, Multiaddr, PeerId};
@@ -20,47 +21,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     client.wait_network_initialized().await?;
 
-    let seq = client
-        .signal_and_wait("ip-allocation", run_params.test_instance_count)
-        .await?;
+    // let ip_addr = match run_params.test_subnet {
+    //     ipnetwork::IpNetwork::V4(network) => {
+    //         let mut octets = network.ip().octets();
+    //         octets[2] = ((seq >> 8) + 1) as u8;
+    //         octets[3] = seq as u8;
+    //         octets.into()
+    //     }
+    //     _ => unimplemented!(),
+    // };
 
-    println!("Seq is: {:?}", seq);
-
-    let ip_addr = match run_params.test_subnet {
-        ipnetwork::IpNetwork::V4(network) => {
-            let mut octets = network.ip().octets();
-            octets[2] = ((seq >> 8) + 1) as u8;
-            octets[3] = seq as u8;
-            octets.into()
-        }
-        _ => unimplemented!(),
-    };
-
-    client
-        .configure_network(testground::network_conf::NetworkConfiguration {
-            network: "default".to_string(),
-            ipv4: Some(ipnetwork::Ipv4Network::new(ip_addr, 32).unwrap()),
-            ipv6: None,
-            enable: true,
-            default: testground::network_conf::LinkShape {
-                latency: 10000000,
-                jitter: 0,
-                bandwidth: 1048576,
-                filter: testground::network_conf::FilterAction::Accept,
-                loss: 0.0,
-                corrupt: 0.0,
-                corrupt_corr: 0.0,
-                reorder: 0.0,
-                reorder_corr: 0.0,
-                duplicate: 0.0,
-                duplicate_corr: 0.0,
-            },
-            rules: None,
-            callback_state: "network-configured".to_string(),
-            callback_target: None,
-            routing_policy: testground::network_conf::RoutingPolicyType::AllowAll,
-        })
-        .await?;
+    // client
+    //     .configure_network(testground::network_conf::NetworkConfiguration {
+    //         network: "default".to_string(),
+    //         ipv4: Some(ipnetwork::Ipv4Network::new(ip_addr, 32).unwrap()),
+    //         ipv6: None,
+    //         enable: true,
+    //         default: testground::network_conf::LinkShape {
+    //             latency: 10000000,
+    //             jitter: 0,
+    //             bandwidth: 1048576,
+    //             filter: testground::network_conf::FilterAction::Accept,
+    //             loss: 0.0,
+    //             corrupt: 0.0,
+    //             corrupt_corr: 0.0,
+    //             reorder: 0.0,
+    //             reorder_corr: 0.0,
+    //             duplicate: 0.0,
+    //             duplicate_corr: 0.0,
+    //         },
+    //         rules: None,
+    //         callback_state: "network-configured".to_string(),
+    //         callback_target: None,
+    //         routing_policy: testground::network_conf::RoutingPolicyType::AllowAll,
+    //     })
+    //     .await?;
 
     let mut swarm = {
         let local_key = identity::Keypair::generate_ed25519();
@@ -75,6 +70,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let local_addr: Multiaddr = {
+        let ip_addr = match if_addrs::get_if_addrs()
+            .unwrap()
+            .into_iter()
+            .find(|iface| iface.name == "eth1")
+            .unwrap()
+            .addr
+            .ip()
+        {
+            std::net::IpAddr::V4(addr) => addr,
+            std::net::IpAddr::V6(_) => unimplemented!(),
+        };
+
         Multiaddr::empty()
             .with(Protocol::Ip4(ip_addr))
             .with(Protocol::Tcp(LISTENING_PORT))
@@ -100,20 +107,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .subscribe("addresses")
         .await
         .take(run_params.test_instance_count as usize)
-        .filter_map(|a| {
-            let remote_addr = Multiaddr::from_str(&a.unwrap()).unwrap();
-            if remote_addr == local_addr {
-                futures::future::ready(None)
-            } else {
-                futures::future::ready(Some(remote_addr))
-            }
-        });
+        .map(|a| Multiaddr::from_str(&a.unwrap()).unwrap())
+        // Note: we sidestep simultaneous connect issues by ONLY connecting to peers
+        // who published their addresses before us (this is enough to dedup and avoid
+        // two peers dialling each other at the same time).
+        //
+        // We can do this because sync service pubsub is ordered.
+        .take_while(|a| futures::future::ready(a != &local_addr));
 
     client.publish("addresses", local_addr.to_string()).await?;
 
     while let Some(addr) = address_stream.next().await {
         swarm.dial(addr).unwrap();
     }
+
+    let mut connected = HashSet::new();
+    loop {
+        match swarm.select_next_some().await {
+            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                connected.insert(peer_id);
+                if connected.len() == run_params.test_instance_count as usize - 1 {
+                    break;
+                }
+            }
+            e => {
+                println!("Event: {:?}", e)
+            }
+        }
+    }
+
+    client
+        .signal_and_wait("connected", run_params.test_instance_count)
+        .await?;
 
     let mut pinged = HashSet::new();
 
@@ -130,6 +155,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             e => {
                 println!("Event: {:?}", e)
+            }
+        }
+    }
+
+    {
+        let all_instances_done = client
+            .signal_and_wait("initial", run_params.test_instance_count)
+            .boxed_local();
+        let mut stream = swarm.take_until(all_instances_done);
+        loop {
+            match stream.next().await {
+                Some(e) => {
+                    println!("Event: {:?}", e)
+                }
+                None => break,
             }
         }
     }
