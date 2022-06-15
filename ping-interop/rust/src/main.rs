@@ -1,6 +1,11 @@
 use env_logger::Env;
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
-use libp2p::{identity, PeerId};
+
+#[cfg(all(feature = "libp2pv0440",))]
+use libp2pv0440::{identity, PeerId};
+
+#[cfg(all(feature = "libp2pv0450",))]
+use libp2pv0450::{identity, PeerId};
 
 const LISTENING_PORT: u16 = 1234;
 
